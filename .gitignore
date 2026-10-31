@@ -1,0 +1,13 @@
+# 构建产物
+build/
+
+# 模型权重（1GB+，自行下载；见 README"端到端运行"）
+models/*.gguf
+
+# 调试产物
+dbg_*
+*.o
+*.a
+
+# Python 缓存
+__pycache__/
