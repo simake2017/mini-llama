@@ -1,4 +1,28 @@
-// 分词器实现：词表加载 + SPM/BPE 编码 + 解码
+// ============================================================================
+// ① 定位：分词器的实现 —— 词表加载、文本改写、按 score 合并、字节兜底、解码
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:1921:llama_vocab::impl::load（词表加载）
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:117:llm_tokenizer_spm_session::tokenize
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:202:try_add_bigram（按 score 合并相邻符号）
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:176:resegment（拆不成词时的字节兜底）
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:4092:llama_vocab::token_to_piece（解码）
+//
+// ③ 动机：
+//    【对照】上游 SPM 与 BPE 各有一份 session（llama-vocab.cpp:117 / :603），两份实现
+//       几乎相同 —— 上游自己在 llama-vocab.cpp:246 标了 TODO 说该合并复用。本仓库合成
+//       一份 merge_tokenize，两条路径只在「要不要预分词」这一处分叉。
+//    【简化】不做 special token 片段提取（tokenizer_st_partition）：Llama 主干 prompt
+//       不含内嵌特殊串；承重结论见 docs/constraints/04-对齐约束.md §2.1 组 B。
+//    【陷阱】上游读 add_bos_token / add_eos_token，本实现读 add_bos / add_eos —— GGUF 里
+//       普遍写的是上游那个名字，所以词表级的覆盖实际读不到（待拍板，docs/02-tokenizer.md §15）。
+//
+// ④ demo + 多方样例：
+//    🟢 合成 SPM 词表：encode("ab") → [1, 8]（BOS + "▁ab"）
+//    🟡 真实 TinyLlama：encode("Hello world") → [1, 15043, 8879, 2096, 29881]
+//    🔴 词表覆盖不到的多字节字符：SPM 路径按 UTF-8 字符逐个拆，单字节才落 BYTE token
+//    调用方：src/tokenizer.h 的 Tokenizer::load / encode / decode 三个入口
+// ============================================================================
 
 #include "tokenizer.h"
 
@@ -8,13 +32,32 @@
 
 namespace minillama {
 
-// U+2581 Lower One Eighth Block，SPM/Llama3 词表里表示空格的转义符
+// ============================================================================
+// ① 定位：SPM 词表里代表空格的转义符 ▁（U+2581，UTF-8 三字节 E2 96 81）
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3285:llama_escape_whitespace
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3357:llama_vocab::impl::tokenize 的转义调用点
+//
+// ③ 动机：
+//    【概念】SPM 词表里不存原始空格 —— 空格是词边界标记，必须可见且不会与词内字符
+//       混淆，所以用 U+2581 这个「方块」占位：编码时 ' ' → ▁、解码时 ▁ → ' '。
+//    【陷阱】这条互转**只对 SPM 词表成立**：BPE 词表存的是原始空格，或经
+//       bytes_to_unicode 映射后的 Ġ（U+0120）。两种转义不能混用。
+//
+// ④ demo + 多方样例：
+//    🟢 合成 SPM 词表：encode("ab") → [1, 8]，而 token 8 的文本就是 "▁ab"
+//    🟡 真实 TinyLlama：encode("Hello world", false) 的首个 token id=15043，文本 "▁Hello"
+//    🔴 真实 TinyLlama 的 decode 会把 ▁ 还原成空格：decode({15043, 8879, 2096, 29881})
+//       → " Hello world"（句首那个空格正是 ▁ 还原出来的）
+//    调用方：src/tokenizer.cpp 的 encode / decode 两端的 replace_all
+// ============================================================================
 static const char * ESCAPED_SPACE = "\xE2\x96\x81";
 
-// 把一个 BYTE token 的文本解析成原始字节，三种格式都认：
-//   "<0x41>" 十六进制格式（llama-spm/gemma）
-//   单原始字节（旧 BPE 词表）
-//   bytes_to_unicode 映射字符（qwen2/gpt2/llama3 BPE）
+// 同一句「代表一个字节」在真实词表里有三种写法：<0xXX> 十六进制（llama-spm / gemma）、
+// 单原始字节（旧 BPE 词表）、bytes_to_unicode 映射字符（qwen2 / gpt2 / llama3）。按文本
+// 形状识别而不是按词表类型分派，才能同时吃下三个家族（上游 byte_to_token 按类型分派，
+// llama-vocab.cpp:3852；差异见 docs/02-tokenizer.md §17.2）。
 static int byte_token_text_to_raw(const std::string & text) {
     if (text.size() == 7 && text[0] == '<' && text[1] == '0' && text[2] == 'x' &&
         text[6] == '>') {
@@ -37,6 +80,7 @@ static int byte_token_text_to_raw(const std::string & text) {
     return -1;
 }
 
+// 就地替换全部出现处；转义与还原共用它，所以语义必须是「全部」而不是「第一处」。
 static void replace_all(std::string & s, const std::string & from, const std::string & to) {
     size_t pos = 0;
     while ((pos = s.find(from, pos)) != std::string::npos) {
@@ -45,10 +89,30 @@ static void replace_all(std::string & s, const std::string & from, const std::st
     }
 }
 
-// ---------------------------------------------------------------------------
-// 加载
-// ---------------------------------------------------------------------------
-
+// ============================================================================
+// ① 定位：词表加载 —— 判类型、读三张平行数组、建正反向索引与字节映射、读特殊 token 开关
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:1921:llama_vocab::impl::load
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:2415:llama_vocab::impl::load 的 scores 长度校验
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3089:llama_vocab::impl::token_to_byte
+//
+// ③ 动机：
+//    【概念】判类型必须最先做：tokenizer.ggml.model 决定后面每个分支（补不补空格、
+//       转不转义、做不做字节映射、要不要预分词），其余步骤都依赖它。
+//    【陷阱】scores / token_type 数组上游会校验长度并抛错（llama-vocab.cpp:2415 /
+//       :2425），本实现直接按下标读 —— 长度不一致时是越界读，属已知缺陷
+//       （docs/02-tokenizer.md §16.2 的「结构档的偏离」表）。
+//    【对照】上游按**词表类型**分派查 BYTE token，本实现按**文本形状**识别 —— 三种
+//       BYTE 文本格式在真实词表里都出现过（docs/02-tokenizer.md §17.2）。
+//
+// ④ demo + 多方样例：
+//    🟢 合成词表（tests/test_tokenizer.cpp）：model=llama → SPM、add_bos=1、256 个 BYTE token
+//    🟡 真实 TinyLlama：32000 个 token、bos=1、eos=2、add_bos=1、scores 与 token_type 都在
+//       （lines/load/vocab_load_line.cpp 第 3 / 6 跳）
+//    🔴 词表类型不是 llama / gpt2 → 抛「不支持的词表类型 tokenizer.ggml.model: rwkv」
+//    调用方：src/main.cpp；lines/load/vocab_load_line.cpp:91
+// ============================================================================
 Tokenizer Tokenizer::load(const GgufFile & gguf) {
     Tokenizer tok;
 
@@ -101,8 +165,9 @@ Tokenizer Tokenizer::load(const GgufFile & gguf) {
         if (types) {
             d.type = static_cast<TokenType>(std::get<int32_t>((*types)[i].v));
         } else {
-            // 【简化】旧版 GGUF 可能没有 token_type 数组：按长度猜
-            // （单字节 token 就是 BYTE，其余 NORMAL）——llama.cpp 早期也这么兜底
+            // 【简化】旧版 GGUF 可能没有 token_type 数组：按长度猜（单字节 token 就是
+            // BYTE，其余 NORMAL）。承重判据：砍掉它，「token 有类型」这个概念塌了吗？
+            // 没塌 —— 类型数组本身在 GGUF 里存在，这里只是给老文件兜底。
             d.type = (d.text.size() == 1) ? TokenType::BYTE : TokenType::NORMAL;
         }
         tok.tokens_.push_back(std::move(d));
@@ -146,12 +211,37 @@ Tokenizer Tokenizer::load(const GgufFile & gguf) {
     return tok;
 }
 
+// 反向索引是合并循环的热路径：每试一次相邻合并就查一次表。
 int Tokenizer::find_by_text(const std::string & text) const {
     auto it = text_to_id_.find(text);
     return it == text_to_id_.end() ? -1 : it->second;
 }
 
-// 单字节 -> token id 的兜底查找链（对应 llama.cpp 的 llama_vocab::byte_to_token）
+// ============================================================================
+// ① 定位：字节兜底的查找链 —— 任意原始字节 → 一个能代表它的 token id
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3852:llama_vocab::byte_to_token
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:176:resegment（调用方，逐字节兜底）
+//
+// ③ 动机：
+//    【概念】词表覆盖不到的文本必须有去处，否则整段文本会丢字符。查找分三级：
+//       显式 BYTE 映射 → bytes_to_unicode 映射字符本身 → 单字节原始文本。
+//    【对照】上游按**词表类型**分派（SPM/UGM 查 <0xXX> 再退到单字节；WPM/BPE 查
+//       unicode_byte_to_utf8(ch)；PLaMo2 查 <0x%02X>），本实现按**文本形状**识别 ——
+//       llama3 词表根本没有显式 BYTE token，只能退到「拿映射字符查表」这一级。
+//    【陷阱】三级都落空时返回 -1，调用方（merge_tokenize）会静默丢弃该字节 ——
+//       不抛异常，因为「词表缺通道」不是调用方的错。
+//
+// ④ demo + 多方样例：
+//    🟢 合成 SPM 词表：encode("x") → [1, 3, 129]，129 = BYTE token 基址 9 + 'x'(120)
+//    🟡 真实 TinyLlama 没有显式 BYTE token，走第二级（映射字符查表）：
+//       encode("\x01\x02") → [1, 29871, 30107, 31468]
+//    🔴 多字节 UTF-8 字符走不到查找链：SPM 路径按 UTF-8 字符取字节（l == 1 才取），
+//       3 字节字符的 3 个字节被整体丢弃 —— 合成 SPM 词表 encode("你") → [1, 3]；
+//       上游 resegment 是逐字节兜底（llama-vocab.cpp:176）
+//    调用方：src/tokenizer.cpp 的 merge_tokenize 收尾段
+// ============================================================================
 int Tokenizer::byte_token(int b) const {
     if (has_byte_map_) {
         int id = byte_to_id_[b];
@@ -168,12 +258,9 @@ int Tokenizer::byte_token(int b) const {
     return find_by_text(std::string(1, static_cast<char>(b)));
 }
 
-// ---------------------------------------------------------------------------
-// 编码共用核心：symbol 链表 + 按 score 优先的相邻合并
-// 【对照】llama.cpp 的 llm_tokenizer_spm_session / llm_tokenizer_bpe_session
-//         各有一份几乎相同的实现（它俩没合并是历史原因），我们合成一份。
-// ---------------------------------------------------------------------------
-
+// SPM / BPE 共用的合并核心：symbol 链表 + 按 score 优先的相邻合并。
+// 【对照】上游 SPM 与 BPE 各有一份几乎相同的实现（llama-vocab.cpp:117 / :603），
+//         本仓库合成一份；两者的分歧点只有「BPE 要先切词」。
 void Tokenizer::merge_tokenize(const std::string & text, std::vector<int> & out) const {
     // symbol = 文本中的一个 UTF-8 字符；用数组 + prev/next 下标模拟链表，
     // 合并时只改下标和长度，物理字符串永不移动（【性能】与 llama.cpp 相同手法）
@@ -270,10 +357,31 @@ void Tokenizer::merge_tokenize(const std::string & text, std::vector<int> & out)
     }
 }
 
-// ---------------------------------------------------------------------------
-// 编码
-// ---------------------------------------------------------------------------
-
+// ============================================================================
+// ① 定位：文本 → token id 序列 —— 加 BOS、改写文本、切词、按 score 合并、加 EOS
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:117:llm_tokenizer_spm_session::tokenize
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:603:llm_tokenizer_bpe_session::tokenize
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3348:llama_vocab::impl::tokenize 的 SPM 补空格判据
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3285:llama_escape_whitespace
+//
+// ③ 动机：
+//    【陷阱】**SPM 句首补空格与 add_special 无关**：add_special 只决定拼不拼 BOS/EOS，
+//       补空格由词表开关 add_space_prefix_ 单独决定。上游判据是 add_space_prefix &&
+//       is_prev_special（llama-vocab.cpp:3348），而 is_prev_special 初值 true（:3335）—— 与 add_special 无关。
+//    【历史】SPM 用 ▁ 标词边界，句首不补空格，首词与后续词就分不开 —— 这条
+//       sentencepiece 规范 llama.cpp 至今保留。
+//    【对照】上游把文本切成 special token 片段与普通文本两类分别处理，本实现整段当一段（不切片段，已登记为可砍，docs/constraints/04-对齐约束.md §2.1 组 B）。
+//
+// ④ demo + 多方样例：
+//    🟢 最小：合成 SPM 词表 encode("ab") → [1, 8]；encode("ab", false) → [8]
+//       —— 仍带句首空格，因为补空格与 add_special 无关
+//    🟡 典型：真实 TinyLlama encode("Hello world") → [1, 15043, 8879, 2096, 29881]
+//    🔴 词表覆盖不到的多字节字符在 SPM 路径上被整体丢弃（实测 encode("😀") → [1, 29871]）；
+//       BPE 路径因为先做了 bytes_to_unicode 映射，字符粒度就是 1 个原始字节（合成 qwen2 词表实测 encode("你") → 3 个 BYTE token）
+//    调用方：src/main.cpp；lines/text/tokenize_line.cpp:80
+// ============================================================================
 std::vector<int> Tokenizer::encode(const std::string & text, bool add_special) const {
     std::vector<int> out;
 
@@ -314,10 +422,28 @@ std::vector<int> Tokenizer::encode(const std::string & text, bool add_special) c
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// 解码
-// ---------------------------------------------------------------------------
-
+// ============================================================================
+// ① 定位：token id 序列 → 文本 —— 按类型分派渲染，再把 ▁ 换回空格
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:4092:llama_vocab::token_to_piece
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3519:llama_vocab::impl::token_to_piece
+//    llama.cpp @ 88b47a755  src/llama-vocab.cpp:3584:llama_vocab::impl::token_to_piece 的 ▁ 还原
+//
+// ③ 动机：
+//    【对照】上游跳过掩码只有 UNKNOWN | CONTROL（llama-vocab.cpp:3521 的 attr_special），
+//       本实现多跳过 UNUSED / UNDEFINED 两种上游不跳的类型 —— 真实 GGUF 里 <s> 常被
+//       标成 USER_DEFINED(4)，上游也照渲染，两边一致。
+//    【陷阱】▁ ↔ 空格是「编码空间 ↔ 文本空间」的边界；BPE 词表走 bytes_to_unicode
+//       逆映射（空格 ↔ U+0120 Ġ），SPM 词表走 ▁ ↔ ' '，两套转义不能混用。
+//
+// ④ demo + 多方样例：
+//    🟢 最小：合成 SPM 词表 decode({1, 8}) → " ab"（BOS 是 CONTROL 被跳过，"▁ab" 还原）
+//    🟡 典型：真实 TinyLlama decode(encode("Hello world")) → "<s> Hello world"
+//    🔴 越界 id 直接跳过、不抛异常 → decode({999999999}) 返回空串
+//       （lines/text/detokenize_line.cpp:106 断言了这一点）
+//    调用方：src/main.cpp / :103；lines/text/detokenize_line.cpp:120
+// ============================================================================
 std::string Tokenizer::decode(const std::vector<int> & ids) const {
     std::string out;
     for (int id : ids) {

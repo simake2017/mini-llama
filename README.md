@@ -34,8 +34,42 @@ ctest --test-dir build --output-on-failure
 
 ## 明确不做
 
-训练、多架构、多后端（CUDA/Metal 等）、GGML 计算图、投机解码、多模态、LoRA、语法采样。理由见 docs/ 各单元对照文档。
+训练、多架构、多后端（CUDA/Metal 等）、GGML 计算图、投机解码、多模态、LoRA、语法采样。
+**每一条都有承重判据结论**（能不能砍 / 为什么没塌），见 `PROJECT.md` 的 Out of Scope 表
+与 `docs/constraints/04-对齐约束.md`。
 
 ## 文档
 
-每单元完成后产出三段式对照文档（我做了啥 / 真实源码在哪 / 真实版多做啥），见 `docs/`。
+| 位置 | 内容 |
+|---|---|
+| `PROJECT.md` | **还原项目声明**：参考实现版本、Must Have / Out of Scope 表、对齐粒度、教学便利代码清单 |
+| `docs/01`~`docs/05` | 5 篇单元技术文档（tech-doc v1.1 骨架 §1~§15 + 还原模式扩展节 §16 对齐面 / §17 踩坑记录） |
+| `docs/constraints/04-对齐约束.md` | **权威约束**：承重判据（能不能砍）+ 24 条砍掉结论 + 对齐粒度落地清单 |
+| `docs/constraints/05-注释规范.md` | **权威约束**：四段式注释 + 还原项目教学化叠加层（教学标签 / 3 档用例 / 日志分级） |
+| `lines/` | **业务线**：把推理主干拆成 8 条端到端子流程，每条线可单跑、可自动校验 |
+
+### 走业务线（推荐入口）
+
+`lines/` 把「一个文件 → 一段文本」拆成 4 族 8 条线，每条线一个可执行程序：
+
+```bash
+./build/mini-llama-lines --list                      # 列出全部 8 条线
+MINILLAMA_MODEL=models/TinyLlama-1.1B-Chat-v1.0.Q8_0.gguf \
+    ./build/mini-llama-lines prefill --step           # 走一条线，逐步打印每跳的观测
+```
+
+| 族 | 线 | 一句话 |
+|---|---|---|
+| **load** 载入域 | `model_load` / `vocab_load` | GGUF 文件 / 元数据 → 可前向的 Model / 可用的 Tokenizer |
+| **text** 文本域 | `tokenize` / `detokenize` | 文本 ↔ token id 序列 |
+| **infer** 推理工域 | `prefill` / `decode` | 推进 KV Cache → 采样 → 写回 → 自回归循环 |
+| **numeric** 数值域 | `dequant` / `sample` | 量化字节 → F32 权重；logits → token |
+
+族 README（`lines/<族>/README.md`）各含七节：链路图 / 逐跳对照 / 学习问题的答案 /
+认知纠错记录 / 真机实测 / 差异注明 / 可观测点。合计 **58 条自动校验**。
+
+### 引用约定
+
+- **上游锚点**带行号，因为它们钉死在某个 commit 上：`llama.cpp @ 88b47a755  src/llama-vocab.cpp:1921:llama_vocab::impl::load`
+- **本仓库引用**只写文件 + 符号，不写行号 —— 注释一改行号就漂，符号名才稳：
+  `src/tokenizer.cpp`（`Tokenizer::encode`）

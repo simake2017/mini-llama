@@ -1,12 +1,32 @@
-// mini-llama：命令行推理入口（单元 4 成型，单元 5 支持量化模型）
+// ============================================================================
+// ① 定位：命令行推理入口 —— 一个 main 走完「加载 → 编码 → prefill → 采样 → 生成」
+//
+// ② 源码锚点：
+//    llama.cpp @ 88b47a755  examples/simple/simple.cpp:14:main
+//                          —— 上游 examples 层最小的「加载 → decode → 采样」骨架
+//    llama.cpp @ 88b47a755  common/sampling.cpp:334（默认采样链的装配处）
+//
+// ③ 动机：
+//    【教学】本文件含教学便利代码：上游把这段拆成 examples/ 下几十个程序，本仓库
+//      合成一个 main 覆盖全链路。登记见 docs/03-forward.md §16.4 的「CLI 入口」项。
+//    【概念】CLI 只是「编排」，不含任何模型数学：真正的计算在 Model / Tokenizer /
+//      Sampler 里——所以本文件能一眼看完推理链的全貌。
+//    【简化】只支持单轮、不读 stdin、无对话历史：真实版 llama-cli 还有交互模式、
+//      多会话、grammar 约束等；本项目只留一条最短可验证路径。
+//    【对照】上游用 llama_batch 一次喂多个 token 做 prefill；本实现逐 token 调
+//      forward_token，语义相同——prefill 就是把 prompt 逐位推进 KV cache。
+//
+// ④ demo + 多方样例：
+//    🟢 最小：--model X.gguf --prompt "Hi" --n 4 → 生成 4 个 token 后退出。
+//    🟡 典型：--model models/TinyLlama-1.1B-Chat-v1.0.Q8_0.gguf --prompt "Hi" --n 4
+//       → stderr 摘要「层数=22 维度=2048 头=32/4 词表=32000」，stdout 输出续写。
+//    🔴 极限：--temp 1.2 --top-k 100 --top-p 0.98 → 开放生成；本项目是纯 CPU
+//       单线程，--n 越大越慢，别拿它跑长上下文。
+// ============================================================================
 //
 // 用法:
 //   mini-llama --model model.gguf --prompt "你好" [--temp 0.8] [--top-k 40]
 //              [--top-p 0.95] [--n 128] [--seed 1234]
-//
-// 【对照】examples/simple-chat / llama-cli 的最小骨架：
-//   加载模型 -> 编码 prompt -> prefill 逐 token 推进 KV cache ->
-//   采样下一个 token -> 前向 -> 重复直到 EOS 或达到上限。
 
 #include "gguf.h"
 #include "kvcache.h"
@@ -50,28 +70,29 @@ int main(int argc, char ** argv) {
     if (model_path.empty() || prompt.empty()) { usage(argv[0]); return 2; }
 
     try {
-        // ① 加载三件套
+        // ① 加载三件套：同一个 GGUF 文件，分词器读词表、模型读权重
         GgufFile gguf = GgufFile::load(model_path);
         Tokenizer tok = Tokenizer::load(gguf);
         Model model = Model::load(gguf);
         const HParams & hp = model.hparams();
 
-        std::cerr << "模型: " << model_path
+        std::cerr << "模型: " << model_path          // 日志级别 0：关键生命周期事件
                   << "  层数=" << hp.n_layer
                   << "  维度=" << hp.n_embd
                   << "  头=" << hp.n_head << "/" << hp.n_head_kv
                   << "  词表=" << hp.n_vocab << "\n";
 
-        // ② 编码 + prefill
+        // ② 编码 + prefill：prefill = 把 prompt 逐位推进 KV cache，
+        //    每一步的 pos 就是该 token 在 prompt 里的下标
         auto ids = tok.encode(prompt, true);
         KVCache kv(hp.n_layer, hp.kv_dim(), hp.n_ctx);
         std::vector<float> logits;
         for (size_t p = 0; p < ids.size(); p++) {
             logits = model.forward_token(ids[p], static_cast<int>(p), kv);
         }
-        std::cerr << "prefill 完成: " << ids.size() << " tokens\n";
+        std::cerr << "prefill 完成: " << ids.size() << " tokens\n";   // 日志级别 1：摘要
 
-        // ③ 自回归生成
+        // ③ 自回归生成：采样 → 前向 → 再采样；KV cache 跨轮复用，历史不重算
         Sampler sampler(sp);
         auto t0 = std::chrono::steady_clock::now();
         int gen = 0;
@@ -84,7 +105,7 @@ int main(int argc, char ** argv) {
         }
         auto t1 = std::chrono::steady_clock::now();
         double sec = std::chrono::duration<double>(t1 - t0).count();
-        std::cerr << "\n生成 " << gen << " tokens，耗时 " << sec << "s"
+        std::cerr << "\n生成 " << gen << " tokens，耗时 " << sec << "s"   // 日志级别 1：摘要
                   << "（" << (sec > 0 ? gen / sec : 0) << " tok/s）\n";
         return 0;
     } catch (const std::exception & e) {
