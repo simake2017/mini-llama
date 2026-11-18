@@ -2,6 +2,8 @@
 
 用 C++17（仅标准库 + POSIX mmap）从零还原 llama.cpp 的推理主干：
 
+第一次接触本项目，请先读[产品与技术指南](docs/guide/README.md)：从“它是什么、能做什么”开始，分为产品篇 4 章、技术篇 7 章，结合输入、输出和中间过程实例说明。
+
 | 单元 | 能力 | 对照真实版 |
 |---|---|---|
 | 1 | GGUF 模型加载 | ggml/src/gguf.cpp + llama-model-loader.cpp |
